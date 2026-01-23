@@ -1,0 +1,244 @@
+Option Explicit
+
+' =====================================================
+' Macro optimizada para marcar duplicados por hogar
+' Versión mejorada: ignora filas del mismo hogar con igual CODTIPODOCUMENTO
+' =====================================================
+
+Public Sub MarcarDuplicadosOptimizado()
+    On Error GoTo ErrHandler
+    
+    Dim ws As Worksheet: Set ws = ThisWorkbook.ActiveSheet
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then
+        MsgBox "No hay datos.", vbInformation
+        Exit Sub
+    End If
+    
+    Const GROUP_SIZE_LIMIT As Long = 300 ' ajustar según memoria/tiempo (evita O(n^2) en grupos enormes)
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    Dim rng As Range
+    Set rng = ws.Range("A2:I" & lastRow)
+    Dim data As Variant
+    data = rng.Value ' leer todo a memoria
+    Dim nRows As Long: nRows = UBound(data, 1)
+    
+    ' Arrays de trabajo (1..nRows)
+    Dim results() As String: ReDim results(1 To nRows)
+    Dim colorFlag() As Boolean: ReDim colorFlag(1 To nRows)
+    Dim codArr() As String: ReDim codArr(1 To nRows)           ' CODTIPODOCUMENTO
+    Dim genArr() As String: ReDim genArr(1 To nRows)
+    Dim fnacArr() As String: ReDim fnacArr(1 To nRows)
+    Dim nameArr() As String: ReDim nameArr(1 To nRows)
+    Dim hogarKey As String
+    
+    Dim i As Long
+    For i = 1 To nRows
+        codArr(i) = Trim(CStr(data(i, 5)))  ' COLUMNA E = CODTIPODOCUMENTO
+        genArr(i) = UCase(Trim(CStr(data(i, 8))))
+        If genArr(i) <> "" Then genArr(i) = Left(genArr(i), 1)
+        fnacArr(i) = NormalizarFechaParaComparar(data(i, 7))
+        nameArr(i) = NormalizeName(CStr(data(i, 6)))
+        If i Mod 2000 = 0 Then Application.StatusBar = "Normalizando datos... fila " & i & " / " & nRows
+    Next i
+    
+    ' Mapear hogares -> colección de índices
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    Dim col As Collection
+    For i = 1 To nRows
+        hogarKey = Trim(CStr(data(i, 1)))
+        If hogarKey = "" Then hogarKey = "|_NO_HOGAR_|"
+        If Not dict.Exists(hogarKey) Then
+            Set col = New Collection
+            dict.Add hogarKey, col
+        End If
+        dict(hogarKey).Add i
+    Next i
+    
+    ' Procesar cada grupo de hogar
+    Dim key As Variant
+    Dim items As Collection
+    Dim a As Long, b As Long
+    Dim iRow As Long, jRow As Long
+    Dim dupCount As Long: dupCount = 0
+    Dim reason As String
+    Dim groupCount As Long
+    Dim d1 As Date, d2 As Date
+    Dim diffD As Long, diffM As Long
+    
+    For Each key In dict.Keys
+        Set items = dict(key)
+        groupCount = items.Count
+        If groupCount < 2 Then GoTo NextGroup
+        
+        ' Si el grupo es demasiado grande
+        If groupCount > GROUP_SIZE_LIMIT Then
+            reason = "Revisar grupo grande: Hogar " & key & " (size=" & groupCount & ")"
+            For a = 1 To groupCount
+                iRow = items(a)
+                results(iRow) = results(iRow) & IIf(results(iRow) <> "", " ; ", "") & reason
+                colorFlag(iRow) = True
+            Next a
+            dupCount = dupCount + groupCount
+            GoTo NextGroup
+        End If
+        
+        ' Comparaciones dentro del grupo
+        For a = 1 To groupCount - 1
+            iRow = items(a)
+            For b = a + 1 To groupCount
+                jRow = items(b)
+                
+                ' ⚠️ Nueva regla: si tienen el mismo CODTIPODOCUMENTO → no comparar
+                If codArr(iRow) <> "" And codArr(jRow) <> "" Then
+                    If codArr(iRow) = codArr(jRow) Then GoTo ContinuePair
+                End If
+                
+                ' Regla especial: si cod ambos = 1 -> nombres deben ser iguales
+                If Val(codArr(iRow)) = 1 And Val(codArr(jRow)) = 1 Then
+                    If nameArr(iRow) <> nameArr(jRow) Then GoTo ContinuePair
+                End If
+                
+                ' Género distinto → descartar
+                If genArr(iRow) <> "" And genArr(jRow) <> "" Then
+                    If Left(genArr(iRow), 1) <> Left(genArr(jRow), 1) Then GoTo ContinuePair
+                End If
+                
+                ' Fecha de nacimiento: si existe, comparar
+                If fnacArr(iRow) <> "" And fnacArr(jRow) <> "" Then
+                    d1 = CDate(fnacArr(iRow))
+                    d2 = CDate(fnacArr(jRow))
+                    diffD = Abs(DateDiff("d", d1, d2))
+                    diffM = Abs(DateDiff("m", d1, d2))
+                    If Not (diffD = 0 Or diffD = 1 Or diffM = 1) Then GoTo ContinuePair
+                End If
+                
+                ' Coincidencia de nombres
+                If nameArr(iRow) = nameArr(jRow) _
+                   Or InStr(1, nameArr(iRow), LastWord(nameArr(jRow)), vbTextCompare) > 0 _
+                   Or InStr(1, nameArr(jRow), LastWord(nameArr(iRow)), vbTextCompare) > 0 _
+                   Or IsNameMissing(nameArr(iRow)) _
+                   Or IsNameMissing(nameArr(jRow)) Then
+                   
+                    reason = "Posible duplicado: Hogar " & data(iRow, 1)
+                    If fnacArr(iRow) <> "" Or fnacArr(jRow) <> "" Then reason = reason & " + FNAC"
+                    If genArr(iRow) <> "" Or genArr(jRow) <> "" Then reason = reason & " + GEN"
+                    
+                    If nameArr(iRow) = nameArr(jRow) Then
+                        reason = reason & " | Nombres idénticos"
+                    ElseIf IsNameMissing(nameArr(iRow)) Or IsNameMissing(nameArr(jRow)) Then
+                        reason = reason & " | Nombre faltante"
+                    Else
+                        reason = reason & " | Coincidencia parcial"
+                    End If
+                    reason = reason & " | CODS: " & codArr(iRow) & " vs " & codArr(jRow)
+                    
+                    results(iRow) = results(iRow) & IIf(results(iRow) <> "", " ; ", "") & reason
+                    results(jRow) = results(jRow) & IIf(results(jRow) <> "", " ; ", "") & reason
+                    colorFlag(iRow) = True
+                    colorFlag(jRow) = True
+                    
+                    dupCount = dupCount + 1
+                End If
+                
+ContinuePair:
+            Next b
+        Next a
+NextGroup:
+        If (dupCount Mod 1000) = 0 Then Application.StatusBar = "Procesando duplicados... encontrados: " & dupCount
+    Next key
+    
+    ' Escribir resultados en columna J
+    Dim outRng As Range
+    Set outRng = ws.Range("J2").Resize(nRows, 1)
+    Dim outArr() As Variant: ReDim outArr(1 To nRows, 1 To 1)
+    For i = 1 To nRows
+        outArr(i, 1) = results(i)
+    Next i
+    outRng.Value = outArr
+    
+    ' Aplicar color a filas marcadas
+    For i = 1 To nRows
+        If colorFlag(i) Then
+            ws.Range("A" & (i + 1) & ":I" & (i + 1)).Interior.Color = RGB(255, 230, 153)
+        End If
+    Next i
+    
+    Application.StatusBar = False
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    
+    MsgBox "Búsqueda completada. Se marcaron " & dupCount & " coincidencias. (Grupos grandes: " & CountLargeGroups(dict, GROUP_SIZE_LIMIT) & ")", vbInformation
+    Exit Sub
+
+ErrHandler:
+    Application.StatusBar = False
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    MsgBox "Error: " & Err.Number & " - " & Err.Description, vbExclamation
+End Sub
+
+' =====================================================
+' FUNCIONES AUXILIARES
+' =====================================================
+
+Private Function CountLargeGroups(d As Object, threshold As Long) As Long
+    Dim k As Variant, cnt As Long, total As Long
+    For Each k In d.Keys
+        cnt = d(k).Count
+        If cnt > threshold Then total = total + 1
+    Next k
+    CountLargeGroups = total
+End Function
+
+Private Function NormalizeName(ByVal txt As String) As String
+    Dim s As String
+    s = UCase(Trim$(txt))
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    s = Replace(s, vbTab, " ")
+    s = Application.WorksheetFunction.Trim(s)
+    NormalizeName = s
+End Function
+
+Private Function LastWord(ByVal txt As String) As String
+    Dim arr() As String
+    txt = Trim$(txt)
+    If txt = "" Then
+        LastWord = ""
+    Else
+        arr = Split(txt, " ")
+        LastWord = arr(UBound(arr))
+    End If
+End Function
+
+Private Function IsNameMissing(ByVal txt As String) As Boolean
+    Dim s As String
+    s = UCase(Trim$(txt))
+    IsNameMissing = (s = "" Or Left(s, 2) = "SN" Or Left(s, 8) = "SIN DATO" _
+        Or Left(s, 4) = "RRNN" Or Left(s, 2) = "RN" Or Left(s, 5) = "SR SR")
+End Function
+
+Private Function NormalizarFechaParaComparar(ByVal v As Variant) As String
+    Dim s As String
+    If IsDate(v) Then
+        NormalizarFechaParaComparar = Format(CDate(v), "yyyy-mm-dd")
+    Else
+        s = Trim$(CStr(v))
+        If s = "" Then
+            NormalizarFechaParaComparar = ""
+        ElseIf IsDate(s) Then
+            NormalizarFechaParaComparar = Format(CDate(s), "yyyy-mm-dd")
+        Else
+            NormalizarFechaParaComparar = ""
+        End If
+    End If
+End Function
