@@ -1,0 +1,15 @@
+ASUNTO:  BIMESTRE VI - INACTIVAR SOLICITUD DE POSTULACIÓN A DEMANDA
+
+MENSAJE:
+
+Estimados, buenas tardes:
+
+Se solicita, por favor, que para el NU_DOCUMENTO = [XXX], según el ID_SOLICITUD = XXX, se actualice CO_ESTADO = 7.
+
+Se adjunta la nómina para su revisión.
+
+Saludos cordiales.
+
+Gracias.
+
+ 
